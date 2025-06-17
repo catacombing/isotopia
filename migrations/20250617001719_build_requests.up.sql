@@ -3,7 +3,7 @@ CREATE TABLE requests (
     packages TEXT PRIMARY KEY NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'building', 'done')),
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Update change timestamp whenever status is changed.

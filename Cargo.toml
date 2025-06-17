@@ -10,5 +10,5 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.4"
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "chrono"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
