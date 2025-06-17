@@ -1,0 +1,14 @@
+[package]
+name = "isotopia"
+version = "0.1.0"
+description = "ALARM iso buildserver"
+authors = ["Christian Duerr <contact@christianduerr.com>"]
+repository = "https://github.com/catacombing/isotopia"
+rust-version = "1.85.0"
+license = "GPL-3.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.4"
+sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
