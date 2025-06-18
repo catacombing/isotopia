@@ -1,21 +1,24 @@
 //! ALARM checksum validation.
 
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use md5::Context;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{error, info};
+
+use crate::api::IMAGE_DIRECTORY;
+use crate::db::Db;
 
 /// File in which known checksums are stored.
 const CHECKSUMS_PATH: &str = "./alarm_checksums";
 
 /// ALARM tarball download URI.
-const TARBALL_URI: &str = "https://archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz";
+const TARBALL_MD5_URI: &str = "https://archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.md5";
 
 /// Minimum frequency between new download attempts.
-const MIN_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const MIN_INTERVAL: Duration = Duration::from_secs(60 * 5);
 
 /// Maximum number of historic checksums stored.
 const MAX_CHECKSUMS: usize = 32;
@@ -24,12 +27,13 @@ const MAX_CHECKSUMS: usize = 32;
 pub struct AlarmChecksumCache {
     data: RwLock<AlarmChecksumCacheData>,
     enabled: bool,
+    db: Arc<Db>,
 }
 
 impl AlarmChecksumCache {
-    pub async fn new() -> Self {
+    pub async fn new(db: Arc<Db>) -> Self {
         let enabled = !env::var("VALIDATE_TARBALL_MD5").is_ok_and(|v| v == "0");
-        Self { enabled, data: RwLock::new(AlarmChecksumCacheData::new().await) }
+        Self { enabled, db, data: RwLock::new(AlarmChecksumCacheData::new().await) }
     }
 
     /// Get the latest know checksum.
@@ -58,32 +62,55 @@ impl AlarmChecksumCache {
             return false;
         }
 
-        // If the last update was recently, assume the checksum is invalid.
+        // Get latest available checksum.
+        drop(data);
+        let latest_checksum = self.update_checksum().await;
+
+        latest_checksum.is_some_and(|md5| md5 == md5sum)
+    }
+
+    /// Check for ALARM rootfs checksum updates.
+    ///
+    /// Returns the new checksum if it has changed.
+    pub async fn update_checksum(&self) -> Option<String> {
+        // Debounce excessive update requests.
+        let data = self.data.read().await;
         let now = Instant::now();
         if now - data.last_update < MIN_INTERVAL {
-            return false;
+            return None;
         }
 
-        // If it's an unknown checksum and we haven't recently checked for
-        // updates, download the latest tarball version.
+        // Get latest checksum from archlinuxarm.org.
         drop(data);
-        let lastest_checksum = Self::latest_checksum().await;
+        let latest_checksum = Self::latest_checksum().await;
         let mut data = self.data.write().await;
         data.last_update = now;
 
-        if let Some(latest_checksum) = lastest_checksum
+        // Update known checksums.
+        if let Some(latest_checksum) = latest_checksum
             && data.md5sums.first() != Some(&latest_checksum)
         {
             info!("Adding new ALARM tarball MD5: {latest_checksum}");
 
             // Update cache data.
-            data.md5sums.insert(0, latest_checksum);
+            data.md5sums.insert(0, latest_checksum.clone());
             data.md5sums.truncate(MAX_CHECKSUMS);
 
+            // Write new checksums to cache file.
             Self::persist_checksums(&data.md5sums).await;
+
+            // Delete all outdated requests and images.
+            if let Err(err) = fs::remove_dir_all(IMAGE_DIRECTORY).await {
+                error!("Failed to delete image directory: {err}");
+            }
+            if let Err(err) = self.db.remove_done().await {
+                error!("Failed to remove outdated requests: {err}");
+            }
+
+            return Some(latest_checksum);
         }
 
-        data.md5sums.first().is_some_and(|md5| md5 == md5sum)
+        None
     }
 
     /// Get the latest ALARM tarball checksum.
@@ -91,29 +118,23 @@ impl AlarmChecksumCache {
     /// This will download the latest tarball from archlinuxarm.org,
     /// so it must not be called frequently.
     async fn latest_checksum() -> Option<String> {
-        info!("Downloading latest ALARM tarball…");
+        info!("Downloading latest ALARM tarball MD5…");
 
         // Send request for the latest ALARM tarball.
-        let mut request = reqwest::get(TARBALL_URI)
+        let request = reqwest::get(TARBALL_MD5_URI)
             .await
-            .inspect_err(|err| error!("ALARM tarball request failed: {err}"))
+            .inspect_err(|err| error!("ALARM tarball MD5 request failed: {err}"))
             .ok()?;
 
-        // Compute checksum in chunks, to avoid excessive memory usage.
-        let mut checksum_context = Context::new();
-        loop {
-            match request.chunk().await {
-                Ok(Some(chunk)) => checksum_context.consume(&chunk),
-                Ok(None) => break,
-                Err(err) => {
-                    error!("Failed to read ALARM tarball response: {err}");
-                    return None;
-                },
-            }
-        }
+        // Parse checksum response.
+        let checksum = request
+            .text()
+            .await
+            .inspect_err(|err| error!("Invalid ALARM tarball MD5 response: {err}"))
+            .ok()?;
+        let (md5, _) = checksum.split_once(' ')?;
 
-        // Finalize the checksum
-        Some(format!("{:x}", checksum_context.compute()))
+        Some(md5.into())
     }
 
     /// Write known checksums to disk.

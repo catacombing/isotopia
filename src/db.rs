@@ -1,5 +1,7 @@
 //! SQLite requests DB.
 
+use std::fmt::{self, Display, Formatter};
+
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool};
 use sqlx::types::chrono::NaiveDateTime;
@@ -76,7 +78,7 @@ impl Db {
     }
 
     /// Get the status of a build.
-    pub async fn status(&self, device: &str, md5sum: &str) -> Result<Option<Status>, Error> {
+    pub async fn status(&self, device: Device, md5sum: &str) -> Result<Option<Status>, Error> {
         let status = sqlx::query_scalar!(
             r#"
                 SELECT status as "status: _"
@@ -94,7 +96,7 @@ impl Db {
     /// Update the status of a build.
     pub async fn set_status(
         &self,
-        device: &str,
+        device: Device,
         md5sum: &str,
         status: Status,
     ) -> Result<(), Error> {
@@ -166,9 +168,16 @@ impl Db {
         Ok(())
     }
 
+    /// Update the status of a build, without verifying the origin state.
+    ///
+    /// # Safety
+    ///
+    /// Using this to transition to a state like `Done` will put the application
+    /// in an inconsistent state, which might require manual intervention to
+    /// resolve.
     pub async unsafe fn set_status_unchecked(
         &self,
-        device: &str,
+        device: Device,
         md5sum: &str,
         status: Status,
     ) -> Result<(), Error> {
@@ -180,6 +189,15 @@ impl Db {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Remove all finished requests.
+    ///
+    /// This should be called whenever the image files have been deleted, to
+    /// avoid inconsistency between database and image storage.
+    pub async fn remove_done(&self) -> Result<(), Error> {
+        sqlx::query!("DELETE FROM requests WHERE status = 'done'").execute(&self.pool).await?;
         Ok(())
     }
 }
@@ -249,6 +267,15 @@ pub enum Device {
     PinePhone,
 }
 
+impl Display for Device {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        match self {
+            Self::PinePhonePro => write!(f, "pinephone-pro"),
+            Self::PinePhone => write!(f, "pinephone"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::time::{Duration, sleep};
@@ -263,10 +290,9 @@ mod tests {
         let combined_packages = "__test_build_lifecycle catacomb kumo";
         let md5sum = format!("{:x}", md5::compute(combined_packages));
         let device = Device::PinePhonePro;
-        let device_str = "pinephone-pro";
 
         // Cleanup old test data.
-        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device_str,)
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
             .execute(&db.pool)
             .await
             .unwrap();
@@ -289,7 +315,7 @@ mod tests {
         assert!(is_pending);
 
         // Mark request as building.
-        db.set_status(device_str, &md5sum, Status::Building).await.unwrap();
+        db.set_status(device, &md5sum, Status::Building).await.unwrap();
 
         // Building jobs should be hidden from pending list.
         let pending_building = db.pending().await.unwrap();
@@ -297,7 +323,7 @@ mod tests {
         assert!(!is_pending);
 
         // Mark request as done.
-        db.set_status(device_str, &md5sum, Status::Done).await.unwrap();
+        db.set_status(device, &md5sum, Status::Done).await.unwrap();
 
         // Done jobs should be hidden from pending list.
         let pending_done = db.pending().await.unwrap();
@@ -317,10 +343,9 @@ mod tests {
         let combined_packages = &packages[0];
         let md5sum = format!("{:x}", md5::compute(combined_packages));
         let device = Device::PinePhone;
-        let device_str = "pinephone";
 
         // Cleanup old test data.
-        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device_str)
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
             .execute(&db.pool)
             .await
             .unwrap();
@@ -330,7 +355,7 @@ mod tests {
         let initial_timestamp = sqlx::query_scalar!(
             "SELECT updated_at FROM requests WHERE md5sum = $1 AND device = $2",
             md5sum,
-            device_str,
+            device,
         )
         .fetch_one(&db.pool)
         .await
@@ -340,11 +365,11 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
 
         // Get timestamp after status change.
-        db.set_status(device_str, &md5sum, Status::Done).await.unwrap();
+        db.set_status(device, &md5sum, Status::Done).await.unwrap();
         let after_update = sqlx::query_scalar!(
             "SELECT updated_at FROM requests WHERE md5sum = $1 AND device = $2",
             md5sum,
-            device_str,
+            device,
         )
         .fetch_one(&db.pool)
         .await
@@ -361,20 +386,19 @@ mod tests {
         let combined_packages = &packages[0];
         let md5sum = format!("{:x}", md5::compute(combined_packages));
         let device = Device::PinePhonePro;
-        let device_str = "pinephone-pro";
 
         // Cleanup old test data.
-        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device_str)
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
             .execute(&db.pool)
             .await
             .unwrap();
 
         // Mark package as done.
         db.add_request(device, packages.clone()).await.unwrap();
-        db.set_status(device_str, &md5sum, Status::Done).await.unwrap();
+        db.set_status(device, &md5sum, Status::Done).await.unwrap();
 
         // Ensure status cannot 'regress'.
-        db.set_status(device_str, &md5sum, Status::Pending).await.unwrap();
+        db.set_status(device, &md5sum, Status::Pending).await.unwrap();
         let pending_done = db.pending().await.unwrap();
         let is_pending = pending_done.iter().any(|r| r.md5sum == md5sum && r.device == device);
         assert!(!is_pending);
@@ -388,18 +412,17 @@ mod tests {
         let combined_packages = &packages[0];
         let md5sum = format!("{:x}", md5::compute(combined_packages));
         let device = Device::PinePhone;
-        let device_str = "pinephone";
 
         // Cleanup old test data.
-        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device_str)
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
             .execute(&db.pool)
             .await
             .unwrap();
 
         db.add_request(device, packages.clone()).await.unwrap();
-        db.set_status(device_str, &md5sum, Status::Building).await.unwrap();
+        db.set_status(device, &md5sum, Status::Building).await.unwrap();
 
-        let result = db.set_status(device_str, &md5sum, Status::Building).await;
+        let result = db.set_status(device, &md5sum, Status::Building).await;
         assert!(matches!(result, Err(Error::StatusConflict)));
     }
 
@@ -412,7 +435,7 @@ mod tests {
         let md5sum = format!("{:x}", md5::compute(combined_packages));
 
         // Cleanup old test data.
-        sqlx::query!("DELETE FROM requests WHERE md5sum = $1", md5sum,)
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1", md5sum)
             .execute(&db.pool)
             .await
             .unwrap();
@@ -422,14 +445,58 @@ mod tests {
 
         // Put PPP into building state.
         db.add_request(Device::PinePhonePro, packages.clone()).await.unwrap();
-        db.set_status("pinephone-pro", &md5sum, Status::Building).await.unwrap();
+        db.set_status(Device::PinePhonePro, &md5sum, Status::Building).await.unwrap();
 
         // Reinsert PPP to ensure it's still building.
-        let ppp_status = db.status("pinephone-pro", &md5sum).await.unwrap();
+        let ppp_status = db.status(Device::PinePhonePro, &md5sum).await.unwrap();
         assert_eq!(ppp_status, Some(Status::Building));
 
         // Reinsert PP to ensure it's still pending.
-        let pp_status = db.status("pinephone", &md5sum).await.unwrap();
+        let pp_status = db.status(Device::PinePhone, &md5sum).await.unwrap();
         assert_eq!(pp_status, Some(Status::Pending));
+    }
+
+    #[tokio::test]
+    async fn delete_done() {
+        let db = Db::new().await.unwrap();
+
+        let packages = vec!["__test_delete_done".into()];
+        let combined_packages = &packages[0];
+        let md5sum = format!("{:x}", md5::compute(combined_packages));
+        let device = Device::PinePhone;
+
+        // Cleanup old test data.
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Pending requests aren't deleted.
+        db.add_request(device, packages.clone()).await.unwrap();
+        db.remove_done().await.unwrap();
+        let has_request = sqlx::query!(
+            "SELECT * FROM requests WHERE md5sum = $1 AND device = $2",
+            md5sum,
+            device
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap()
+        .is_some();
+        assert!(has_request);
+
+        // Done requests are deleted.
+        db.set_status(device, &md5sum, Status::Done).await.unwrap();
+        db.remove_done().await.unwrap();
+        let has_request = sqlx::query!(
+            "SELECT * FROM requests WHERE md5sum = $1 AND device = $2",
+            md5sum,
+            device
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap()
+        .is_some();
+        assert!(!has_request);
     }
 }

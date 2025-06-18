@@ -56,13 +56,13 @@ async fn main() {
 /// Server state.
 pub struct State {
     alarm_checksum_cache: AlarmChecksumCache,
-    db: Db,
+    db: Arc<Db>,
 }
 
 impl State {
     async fn new() -> Result<Self, sqlx::Error> {
-        let alarm_checksum_cache = AlarmChecksumCache::new().await;
-        let db = Db::new().await?;
+        let db = Arc::new(Db::new().await?);
+        let alarm_checksum_cache = AlarmChecksumCache::new(db.clone()).await;
         Ok(Self { alarm_checksum_cache, db })
     }
 }
