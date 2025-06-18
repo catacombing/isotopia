@@ -36,7 +36,7 @@ async fn main() {
     let api = api::router().layer(TraceLayer::new_for_http()).with_state(state);
 
     // Bind server to TCP port.
-    let listener = match TcpListener::bind("0.0.0.0:3000").await {
+    let listener = match TcpListener::bind("127.0.0.1:3000").await {
         Ok(listener) => listener,
         Err(err) => {
             error!("Failed to spawn server: {err}");
