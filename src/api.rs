@@ -1,0 +1,251 @@
+//! REST API endpoints.
+
+use std::mem;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State as AxumState};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+use http::{StatusCode, header};
+use serde::Deserialize;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
+use tracing::error;
+
+use crate::db::{Device, Status};
+use crate::{Error, State};
+
+/// Default image output directory.
+const IMAGE_DIRECTORY: &str = "./images";
+
+/// Get the API's request router.
+pub fn router() -> Router<Arc<State>> {
+    Router::new()
+        .route("/pending", get(get_pending))
+        .route("/requests/{device}/{md5sum}/status", put(put_status))
+        .route("/requests", post(post_request))
+        .route(
+            "/requests/{device}/{md5sum}/{alarm_md5sum}/image",
+            post(post_image).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/requests/{device}/{md5sum}/{alarm_md5sum}/image", get(get_image))
+}
+
+/// Get pending build requests.
+async fn get_pending(AxumState(state): AxumState<Arc<State>>) -> Response {
+    let pending = match state.db.pending().await {
+        Ok(pending) => pending,
+        Err(err) => return Error::Sql(err).into_response(),
+    };
+
+    Json(pending).into_response()
+}
+
+/// Set a build job as "in progress".
+async fn put_status(
+    AxumState(state): AxumState<Arc<State>>,
+    Path((device, md5sum)): Path<(String, String)>,
+    Json(status): Json<Status>,
+) -> Response {
+    // Only allow marking requests as 'building' in this endpoint.
+    match status {
+        Status::Building => (),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    }
+
+    // Update request status.
+    match state.db.set_status(&device, &md5sum, Status::Building).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Request a new image build.
+async fn post_request(
+    AxumState(state): AxumState<Arc<State>>,
+    Json(body): Json<PostRequestRequest>,
+) -> Response {
+    let request = match state.db.add_request(body.device, body.packages).await {
+        Ok(status) => status,
+        Err(err) => return Error::Sql(err).into_response(),
+    };
+
+    Json(request).into_response()
+}
+
+/// Upload completed image file.
+async fn post_image(
+    AxumState(state): AxumState<Arc<State>>,
+    Path((device, md5sum, alarm_md5sum)): Path<(String, String, String)>,
+    mut multipart: Multipart,
+) -> Response {
+    // Validate ALARM tarball checksum matches the latest tarball.
+    if !state.alarm_checksum_cache.is_latest(&alarm_md5sum).await {
+        let latest = state.alarm_checksum_cache.latest().await;
+        let msg = format!("MD5 {alarm_md5sum} doesn't match ALARM tarball checksum ({latest:?})");
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // Ensure there is a pending request for this image.
+    if let Err(err) = state.db.set_status(&device, &md5sum, Status::Writing).await {
+        return err.into_response();
+    }
+    let set_on_drop = SetBuildingOnDrop::new(state, device, md5sum);
+
+    // Get first and only form data field with a file name.
+    let mut field = match multipart.next_field().await {
+        Ok(Some(field)) => field,
+        Ok(None) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(err) => return err.status().into_response(),
+    };
+
+    // Do some basic validation to simplify debugging.
+    if field.file_name().is_none() {
+        return (StatusCode::BAD_REQUEST, "multipart/form-data is missing filename")
+            .into_response();
+    }
+    let content_type = field.content_type();
+    if content_type != Some("application/octet-stream") {
+        let msg = format!("invalid multipart content type: {content_type:?}");
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // Ensure image directory exists.
+    if let Err(err) = fs::create_dir_all(IMAGE_DIRECTORY).await {
+        error!("Could not create image file directory: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Open image file handle.
+    let path =
+        format!("{IMAGE_DIRECTORY}/alarm-{}-{}.img.xz", set_on_drop.device, set_on_drop.md5sum);
+    let mut file = match OpenOptions::new().create_new(true).append(true).open(path).await {
+        Ok(file) => file,
+        Err(err) => {
+            error!("Could not create image file: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        },
+    };
+
+    // Write chunked data to our image file.
+    loop {
+        let mut chunk = match field.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        };
+
+        if let Err(err) = file.write_all_buf(&mut chunk).await {
+            error!("Failed image write: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    // Update status code.
+    let ReclaimedSetBuildingOnDrop { state, device, md5sum } = set_on_drop.reclaim();
+    if let Err(err) = state.db.set_status(&device, &md5sum, Status::Done).await {
+        return err.into_response();
+    }
+
+    StatusCode::OK.into_response()
+}
+
+/// Download built image.
+async fn get_image(
+    AxumState(state): AxumState<Arc<State>>,
+    Path((device, md5sum)): Path<(String, String)>,
+) -> Response {
+    // Return 404 if we don't have the image.
+    match state.db.status(&device, &md5sum).await {
+        Ok(Some(Status::Done)) => (),
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => return err.into_response(),
+    }
+
+    // Get an async read stream over the image's content.
+    let filename = format!("alarm-{device}-{md5sum}.img.xz");
+    let path = format!("{IMAGE_DIRECTORY}/{filename}");
+    let file = match File::open(&path).await {
+        Ok(file) => ReaderStream::new(file),
+        Err(err) => {
+            error!("Unable to access completed image file: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        },
+    };
+
+    // Create our response with headers indicating binary file download.
+    let response = Response::builder()
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from_stream(file));
+
+    match response {
+        Ok(response) => response,
+        Err(err) => {
+            error!("Failed to build image GET response: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        },
+    }
+}
+
+/// Request body for new build requests.
+#[derive(Deserialize)]
+struct PostRequestRequest {
+    packages: Vec<String>,
+    device: Device,
+}
+
+/// Guard for automatically setting a request's status to 'building' on drop.
+struct SetBuildingOnDrop {
+    state: Option<Arc<State>>,
+    device: String,
+    md5sum: String,
+}
+
+impl SetBuildingOnDrop {
+    fn new(state: Arc<State>, device: String, md5sum: String) -> Self {
+        Self { state: Some(state), device, md5sum }
+    }
+
+    /// Reclaim the state, to avoid calling the drop impl.
+    fn reclaim(mut self) -> ReclaimedSetBuildingOnDrop {
+        ReclaimedSetBuildingOnDrop {
+            state: self.state.take().unwrap(),
+            device: mem::take(&mut self.device),
+            md5sum: mem::take(&mut self.md5sum),
+        }
+    }
+}
+
+impl Drop for SetBuildingOnDrop {
+    fn drop(&mut self) {
+        // Ignore drop if the status was emptied.
+        let state = match self.state.take() {
+            Some(state) => state,
+            None => return,
+        };
+
+        // Create tokio background job to reset the status.
+        let device = mem::take(&mut self.device);
+        let md5sum = mem::take(&mut self.md5sum);
+        tokio::spawn(async move {
+            // SAFETY: We're already in an inconsistent state here, so we just try to
+            // forcibly recover to the safest alternative state, which is 'building'.
+            if let Err(err) =
+                unsafe { state.db.set_status_unchecked(&device, &md5sum, Status::Building).await }
+            {
+                error!("Failed to set {device} {md5sum} to 'building' on drop: {err}");
+            }
+        });
+    }
+}
+
+/// Container used when consuming [`SetStatusOnDrop`].
+struct ReclaimedSetBuildingOnDrop {
+    state: Arc<State>,
+    device: String,
+    md5sum: String,
+}
