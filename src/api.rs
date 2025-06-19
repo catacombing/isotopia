@@ -80,9 +80,15 @@ async fn post_request(
 /// Upload completed image file.
 async fn post_image(
     AxumState(state): AxumState<Arc<State>>,
+    headers: HeaderMap,
     Path((device, md5sum, alarm_md5sum)): Path<(Device, String, String)>,
     mut multipart: Multipart,
 ) -> Response {
+    // Validate auth secret.
+    if headers.get("authorization").is_none_or(|auth| *auth != state.upload_bearer) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     // Validate ALARM tarball checksum matches the latest tarball.
     if !state.alarm_checksum_cache.is_latest(&alarm_md5sum).await {
         let latest = state.alarm_checksum_cache.latest().await;
@@ -156,14 +162,8 @@ async fn post_image(
 /// Download built image.
 async fn get_image(
     AxumState(state): AxumState<Arc<State>>,
-    headers: HeaderMap,
     Path((device, md5sum)): Path<(Device, String)>,
 ) -> Response {
-    // Validate auth secret.
-    if headers.get("authorization").is_none_or(|auth| *auth != state.upload_bearer) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
     // Check for rootfs updates, to invalidate old images.
     if state.alarm_checksum_cache.update_checksum().await.is_some() {
         return StatusCode::NOT_FOUND.into_response();
