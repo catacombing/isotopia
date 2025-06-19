@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State as AxumState};
+use axum::http::header::HeaderMap;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use http::{StatusCode, header};
 use serde::Deserialize;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -155,8 +156,14 @@ async fn post_image(
 /// Download built image.
 async fn get_image(
     AxumState(state): AxumState<Arc<State>>,
+    headers: HeaderMap,
     Path((device, md5sum)): Path<(Device, String)>,
 ) -> Response {
+    // Validate auth secret.
+    if headers.get("authorization").is_none_or(|auth| *auth != state.upload_bearer) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     // Check for rootfs updates, to invalidate old images.
     if state.alarm_checksum_cache.update_checksum().await.is_some() {
         return StatusCode::NOT_FOUND.into_response();

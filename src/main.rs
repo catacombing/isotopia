@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::{env, process};
 
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use db::Db;
-use http::StatusCode;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info};
@@ -56,14 +56,17 @@ async fn main() {
 /// Server state.
 pub struct State {
     alarm_checksum_cache: AlarmChecksumCache,
+    upload_bearer: String,
     db: Arc<Db>,
 }
 
 impl State {
-    async fn new() -> Result<Self, sqlx::Error> {
+    async fn new() -> Result<Self, Error> {
+        let upload_secret = env::var("UPLOAD_SECRET").map_err(|_| Error::MissingUploadSecret)?;
+        let upload_bearer = format!("Bearer {upload_secret}");
         let db = Arc::new(Db::new().await?);
         let alarm_checksum_cache = AlarmChecksumCache::new(db.clone()).await;
-        Ok(Self { alarm_checksum_cache, db })
+        Ok(Self { alarm_checksum_cache, upload_bearer, db })
     }
 }
 
@@ -73,6 +76,8 @@ pub enum Error {
     Sql(#[from] sqlx::Error),
     #[error("invalid device {0:?}")]
     InvalidDevice(String),
+    #[error("missing UPLOAD_SECRET environment variable")]
+    MissingUploadSecret,
     #[error("invalid request status transition")]
     StatusConflict,
 }
@@ -90,6 +95,8 @@ impl IntoResponse for Error {
                 );
                 (StatusCode::BAD_REQUEST, msg).into_response()
             },
+            // This error is never returned inside a request.
+            Self::MissingUploadSecret => unreachable!(),
         }
     }
 }
