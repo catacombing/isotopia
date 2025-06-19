@@ -100,11 +100,11 @@ impl AlarmChecksumCache {
             Self::persist_checksums(&data.md5sums).await;
 
             // Delete all outdated requests and images.
-            if let Err(err) = fs::remove_dir_all(IMAGE_DIRECTORY).await {
-                error!("Failed to delete image directory: {err}");
-            }
             if let Err(err) = self.db.remove_done().await {
                 error!("Failed to remove outdated requests: {err}");
+            }
+            if let Err(err) = fs::remove_dir_all(IMAGE_DIRECTORY).await {
+                error!("Failed to delete image directory: {err}");
             }
 
             return Some(latest_checksum);
