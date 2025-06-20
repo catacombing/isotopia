@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
-use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::error;
 
 use crate::db::{Device, Status};
@@ -27,9 +27,9 @@ pub const IMAGE_DIRECTORY: &str = "./images";
 pub fn router() -> Router<Arc<State>> {
     // Use allow-all cors policy.
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
-        .allow_methods(AllowMethods::mirror_request())
-        .allow_credentials(true);
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_origin(Any);
 
     Router::new()
         .route("/requests/pending", get(get_pending))
