@@ -25,7 +25,7 @@ pub const IMAGE_DIRECTORY: &str = "./images";
 /// Get the API's request router.
 pub fn router() -> Router<Arc<State>> {
     Router::new()
-        .route("/pending", get(get_pending))
+        .route("/requests/pending", get(get_pending))
         .route("/requests/{device}/{md5sum}/status", put(put_status))
         .route("/requests", post(post_request))
         .route(
