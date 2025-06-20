@@ -14,6 +14,7 @@ use serde::Deserialize;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
+use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
 use tracing::error;
 
 use crate::db::{Device, Status};
@@ -24,6 +25,12 @@ pub const IMAGE_DIRECTORY: &str = "./images";
 
 /// Get the API's request router.
 pub fn router() -> Router<Arc<State>> {
+    // Use allow-all cors policy.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_credentials(true);
+
     Router::new()
         .route("/requests/pending", get(get_pending))
         .route("/requests/{device}/{md5sum}/status", put(put_status))
@@ -34,6 +41,7 @@ pub fn router() -> Router<Arc<State>> {
             post(post_image).layer(DefaultBodyLimit::disable()),
         )
         .route("/requests/{device}/{md5sum}/image", get(get_image))
+        .layer(cors)
 }
 
 /// Get pending build requests.
