@@ -27,6 +27,7 @@ pub fn router() -> Router<Arc<State>> {
     Router::new()
         .route("/requests/pending", get(get_pending))
         .route("/requests/{device}/{md5sum}/status", put(put_status))
+        .route("/requests/{device}/{md5sum}/status", get(get_status))
         .route("/requests", post(post_request))
         .route(
             "/requests/{device}/{md5sum}/{alarm_md5sum}/image",
@@ -60,6 +61,19 @@ async fn put_status(
     // Update request status.
     match state.db.set_status(device, &md5sum, Status::Building).await {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Get the status of a build request.
+async fn get_status(
+    AxumState(state): AxumState<Arc<State>>,
+    Path((device, md5sum)): Path<(Device, String)>,
+) -> Response {
+    // Update request status.
+    match state.db.status(device, &md5sum).await {
+        Ok(Some(status)) => Json(status).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => err.into_response(),
     }
 }
