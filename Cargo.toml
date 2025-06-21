@@ -13,6 +13,7 @@ axum = { version = "0.8.4", features = ["multipart"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 md5 = "0.7.0"
 reqwest = "0.12.20"
+rustix = { version = "1.0.7", features = ["fs"] }
 serde = { version = "1.0.219", features = ["derive"] }
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "chrono"] }
 thiserror = "2.0.12"

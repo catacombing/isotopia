@@ -924,6 +924,7 @@ dependencies = [
  "chrono",
  "md5",
  "reqwest",
+ "rustix",
  "serde",
  "sqlx",
  "thiserror",

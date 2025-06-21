@@ -26,10 +26,7 @@ pub const IMAGE_DIRECTORY: &str = "./images";
 /// Get the API's request router.
 pub fn router() -> Router<Arc<State>> {
     // Use allow-all cors policy.
-    let cors = CorsLayer::new()
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .allow_origin(Any);
+    let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any).allow_origin(Any);
 
     Router::new()
         .route("/requests/pending", get(get_pending))
@@ -150,7 +147,7 @@ async fn post_image(
 
     // Open image file handle.
     let path = format!("{IMAGE_DIRECTORY}/alarm-{}-{}.img.xz", device, set_on_drop.md5sum);
-    let mut file = match OpenOptions::new().create_new(true).append(true).open(path).await {
+    let mut file = match OpenOptions::new().create_new(true).append(true).open(&path).await {
         Ok(file) => file,
         Err(err) => {
             error!("Could not create image file: {err}");
@@ -166,11 +163,24 @@ async fn post_image(
             Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         };
 
+        // Ensure enough storage space is available.
+        let mut cache_lock = set_on_drop.state().image_cache.write().await;
+        if let Err(err) = cache_lock.free_space(chunk.len() as u64).await {
+            error!("Unable to free disk space: {err}");
+            return err.into_response();
+        }
+
+        // Write the data chunk to disk.
         if let Err(err) = file.write_all_buf(&mut chunk).await {
             error!("Failed image write: {err}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+
+        drop(cache_lock);
     }
+
+    // Add image to path cache.
+    set_on_drop.state().image_cache.write().await.add(path);
 
     // Update status code.
     let ReclaimedSetBuildingOnDrop { state, device, md5sum } = set_on_drop.reclaim();
@@ -198,9 +208,12 @@ async fn get_image(
         Err(err) => return err.into_response(),
     }
 
-    // Get an async read stream over the image's content.
+    // Mark image as accessed in LRU cache.
     let filename = format!("alarm-{device}-{md5sum}.img.xz");
     let path = format!("{IMAGE_DIRECTORY}/{filename}");
+    state.image_cache.write().await.accessed(&path).await;
+
+    // Get an async read stream over the image's content.
     let file = match File::open(&path).await {
         Ok(file) => ReaderStream::new(file),
         Err(err) => {
@@ -250,6 +263,11 @@ impl SetBuildingOnDrop {
             device: mem::take(&mut self.device).unwrap(),
             md5sum: mem::take(&mut self.md5sum),
         }
+    }
+
+    /// Get access to the underlying state.
+    fn state(&self) -> &Arc<State> {
+        self.state.as_ref().unwrap()
     }
 }
 

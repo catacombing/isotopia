@@ -1,13 +1,15 @@
-//! ALARM checksum validation.
+//! Memory caches.
 
-use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{env, io};
 
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tracing::{error, info};
 
+use crate::Error;
 use crate::api::IMAGE_DIRECTORY;
 use crate::db::Db;
 
@@ -16,6 +18,9 @@ const CHECKSUMS_PATH: &str = "./alarm_checksums";
 
 /// ALARM tarball download URI.
 const TARBALL_MD5_URI: &str = "https://archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.md5";
+
+/// Minimum free disk space percentage.
+const MIN_FREE_SPACE_PERCENTAGE: f64 = 0.05;
 
 /// Minimum frequency between new download attempts.
 const MIN_INTERVAL: Duration = Duration::from_secs(60 * 5);
@@ -169,4 +174,98 @@ impl AlarmChecksumCacheData {
 
         Self { last_update: Instant::now() - MIN_INTERVAL, md5sums }
     }
+}
+
+/// Installation image LRU cache.
+#[derive(Default)]
+pub struct ImageCache {
+    data: Mutex<ImageCacheData>,
+}
+
+impl ImageCache {
+    /// Obtain a write lock to the underlying data.
+    ///
+    /// This allows calling [`ImageCacheData::free_space`] and writing to disk
+    /// in series while ensuring no other image write claims the space for
+    /// itself.
+    pub async fn write(&self) -> MutexGuard<'_, ImageCacheData> {
+        self.data.lock().await
+    }
+}
+
+/// Writeable installation image LRU cache.
+#[derive(Default)]
+pub struct ImageCacheData {
+    images: Vec<PathBuf>,
+}
+
+impl ImageCacheData {
+    /// Update last access time for a cache entry.
+    pub async fn accessed<P>(&mut self, path: P)
+    where
+        P: AsRef<Path>,
+    {
+        let path = path.as_ref();
+        if let Some(index) = self.images.iter().rposition(|p| p == path) {
+            for i in (1..=index).rev() {
+                self.images.swap(i, i - 1);
+            }
+        }
+    }
+
+    /// Make `size` bytes available for future image writes.
+    ///
+    /// This will remove the least recently used image files until at least
+    /// `size` bytes are available.
+    pub async fn free_space(&mut self, required: u64) -> Result<(), Error> {
+        let mut available_size = available_image_space()?;
+
+        info!("Freeing image space for {required} bytes (available: {available_size})");
+
+        // Remove least recently used images until we have enough space.
+        while available_size < required {
+            // Get the least recently used image's path.
+            let path = match self.images.last() {
+                Some(path) => path,
+                None => break,
+            };
+
+            // Remove the file and add its size to the available space.
+            let size = fs::metadata(&path).await?.len();
+            fs::remove_file(&path).await?;
+            available_size += size;
+
+            info!("Removed {path:?}: {size} bytes (available: {available_size})");
+        }
+
+        // Return error if there's still not enough space left.
+        if available_size < required {
+            let kind = io::ErrorKind::StorageFull;
+            Err(io::Error::new(kind, "insufficient storage left for image").into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Add an image's path to the cache.
+    pub fn add<P>(&mut self, path: P)
+    where
+        P: Into<PathBuf>,
+    {
+        self.images.insert(0, path.into());
+    }
+}
+
+/// Get space available for writing images.
+///
+/// This is based on the available disk space with a slight bit of buffer to
+/// prevent catastrophic failures.
+fn available_image_space() -> Result<u64, Error> {
+    let statvfs = rustix::fs::statvfs(IMAGE_DIRECTORY)?;
+
+    let total = statvfs.f_blocks * statvfs.f_bsize;
+    let reserved = (total as f64 * MIN_FREE_SPACE_PERCENTAGE).ceil() as u64;
+
+    let available = statvfs.f_bavail * statvfs.f_bsize;
+    Ok(available.saturating_sub(reserved))
 }

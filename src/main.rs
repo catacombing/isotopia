@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{env, process};
+use std::{env, io, process};
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -9,10 +9,10 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-use crate::alarm::AlarmChecksumCache;
+use crate::cache::{AlarmChecksumCache, ImageCache};
 
-mod alarm;
 mod api;
+mod cache;
 mod db;
 
 #[tokio::main]
@@ -56,6 +56,7 @@ async fn main() {
 /// Server state.
 pub struct State {
     alarm_checksum_cache: AlarmChecksumCache,
+    image_cache: ImageCache,
     upload_bearer: String,
     db: Arc<Db>,
 }
@@ -64,16 +65,23 @@ impl State {
     async fn new() -> Result<Self, Error> {
         let upload_secret = env::var("UPLOAD_SECRET").map_err(|_| Error::MissingUploadSecret)?;
         let upload_bearer = format!("Bearer {upload_secret}");
+        let image_cache = ImageCache::default();
+
         let db = Arc::new(Db::new().await?);
         let alarm_checksum_cache = AlarmChecksumCache::new(db.clone()).await;
-        Ok(Self { alarm_checksum_cache, upload_bearer, db })
+
+        Ok(Self { alarm_checksum_cache, upload_bearer, image_cache, db })
     }
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("{0}")]
+    Rustix(#[from] rustix::io::Errno),
+    #[error("{0}")]
     Sql(#[from] sqlx::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
     #[error("invalid device {0:?}")]
     InvalidDevice(String),
     #[error("missing UPLOAD_SECRET environment variable")]
@@ -95,6 +103,7 @@ impl IntoResponse for Error {
                 );
                 (StatusCode::BAD_REQUEST, msg).into_response()
             },
+            Self::Rustix(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             // This error is never returned inside a request.
             Self::MissingUploadSecret => unreachable!(),
         }
