@@ -11,7 +11,7 @@ use tracing::{error, info};
 
 use crate::Error;
 use crate::api::IMAGE_DIRECTORY;
-use crate::db::Db;
+use crate::db::{Db, Device};
 
 /// File in which known checksums are stored.
 const CHECKSUMS_PATH: &str = "./alarm_checksums";
@@ -105,7 +105,7 @@ impl AlarmChecksumCache {
             Self::persist_checksums(&data.md5sums).await;
 
             // Delete all outdated requests and images.
-            if let Err(err) = self.db.remove_done().await {
+            if let Err(err) = self.db.delete_done().await {
                 error!("Failed to remove outdated requests: {err}");
             }
             if let Err(err) = fs::remove_dir_all(IMAGE_DIRECTORY).await {
@@ -182,8 +182,8 @@ pub struct ImageCache {
 }
 
 impl ImageCache {
-    pub async fn new() -> Result<Self, io::Error> {
-        Ok(Self { data: Mutex::new(ImageCacheData::new().await?) })
+    pub async fn new(db: Arc<Db>) -> Result<Self, io::Error> {
+        Ok(Self { data: Mutex::new(ImageCacheData::new(db).await?) })
     }
 
     /// Obtain a write lock to the underlying data.
@@ -199,15 +199,16 @@ impl ImageCache {
 /// Writeable installation image LRU cache.
 pub struct ImageCacheData {
     images: Vec<PathBuf>,
+    db: Arc<Db>,
 }
 
 impl ImageCacheData {
-    async fn new() -> Result<Self, io::Error> {
+    async fn new(db: Arc<Db>) -> Result<Self, io::Error> {
         // Get all existing image files.
         let mut images = Vec::new();
         let mut entries = match fs::read_dir(IMAGE_DIRECTORY).await {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self { images }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self { images, db }),
             Err(err) => return Err(err),
         };
         while let Some(entry) = entries.next_entry().await? {
@@ -217,7 +218,7 @@ impl ImageCacheData {
             }
         }
 
-        Ok(Self { images })
+        Ok(Self { images, db })
     }
 }
 
@@ -265,6 +266,26 @@ impl ImageCacheData {
             match fs::remove_file(&path).await {
                 Ok(_) => available_size += size,
                 Err(err) => error!("Unable to remove image: {err}"),
+            }
+
+            // Ensure file is also removed from 'done' images in DB.
+            if let Some((device, md5sum)) = path
+                .to_string_lossy()
+                .strip_suffix(".img.xz")
+                .and_then(|p| p.rsplit_once('-'))
+                .and_then(|(p, md5sum)| Some((p.rsplit_once('-')?.0, md5sum)))
+            {
+                let device = match Device::try_from(device) {
+                    Ok(device) => device,
+                    Err(_) => {
+                        error!("Unable to parse image file's device ({device})");
+                        continue;
+                    },
+                };
+
+                if let Err(err) = self.db.delete(device, md5sum).await {
+                    error!("Unable to delete {device} {md5sum} from DB: {err}");
+                }
             }
 
             info!("Removed {path:?}: {size} bytes (available: {available_size})");

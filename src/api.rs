@@ -228,6 +228,12 @@ async fn get_image(
         Ok(file) => ReaderStream::new(file),
         Err(err) => {
             error!("Unable to access completed image file: {err}");
+
+            // Delete requests to allow rebuild which might fix the issue.
+            if let Err(err) = state.db.delete(device, &md5sum).await {
+                println!("Unable to delete request for {device} {md5sum}: {err}");
+            }
+
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         },
     };

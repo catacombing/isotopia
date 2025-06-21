@@ -192,11 +192,19 @@ impl Db {
         Ok(())
     }
 
+    /// Remove a request.
+    pub async fn delete(&self, device: Device, md5sum: &str) -> Result<(), Error> {
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Remove all finished requests.
     ///
     /// This should be called whenever the image files have been deleted, to
     /// avoid inconsistency between database and image storage.
-    pub async fn remove_done(&self) -> Result<(), Error> {
+    pub async fn delete_done(&self) -> Result<(), Error> {
         sqlx::query!("DELETE FROM requests WHERE status = 'done'").execute(&self.pool).await?;
         Ok(())
     }
@@ -272,6 +280,18 @@ impl Display for Device {
         match self {
             Self::PinePhonePro => write!(f, "pinephone-pro"),
             Self::PinePhone => write!(f, "pinephone"),
+        }
+    }
+}
+
+impl TryFrom<&str> for Device {
+    type Error = ();
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "pinephone-pro" => Ok(Device::PinePhonePro),
+            "pinephone" => Ok(Device::PinePhone),
+            _ => Err(()),
         }
     }
 }
@@ -473,7 +493,7 @@ mod tests {
 
         // Pending requests aren't deleted.
         db.add_request(device, packages.clone()).await.unwrap();
-        db.remove_done().await.unwrap();
+        db.delete_done().await.unwrap();
         let has_request = sqlx::query!(
             "SELECT * FROM requests WHERE md5sum = $1 AND device = $2",
             md5sum,
@@ -487,7 +507,7 @@ mod tests {
 
         // Done requests are deleted.
         db.set_status(device, &md5sum, Status::Done).await.unwrap();
-        db.remove_done().await.unwrap();
+        db.delete_done().await.unwrap();
         let has_request = sqlx::query!(
             "SELECT * FROM requests WHERE md5sum = $1 AND device = $2",
             md5sum,

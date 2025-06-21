@@ -66,10 +66,9 @@ impl State {
         let upload_secret = env::var("UPLOAD_SECRET").map_err(|_| Error::MissingUploadSecret)?;
         let upload_bearer = format!("Bearer {upload_secret}");
 
-        let image_cache = ImageCache::new().await?;
-
         let db = Arc::new(Db::new().await?);
         let alarm_checksum_cache = AlarmChecksumCache::new(db.clone()).await;
+        let image_cache = ImageCache::new(db.clone()).await?;
 
         Ok(Self { alarm_checksum_cache, upload_bearer, image_cache, db })
     }
