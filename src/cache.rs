@@ -237,6 +237,11 @@ impl ImageCacheData {
     pub async fn free_space(&mut self, required: u64) -> Result<(), Error> {
         let mut available_size = available_image_space()?;
 
+        // Short-circuit if no space needs to be freed.
+        if available_size >= required {
+            return Ok(())
+        }
+
         info!("Freeing image space for {required} bytes (available: {available_size})");
 
         // Remove least recently used images until we have enough space.
