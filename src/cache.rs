@@ -205,10 +205,15 @@ impl ImageCacheData {
     async fn new() -> Result<Self, io::Error> {
         // Get all existing image files.
         let mut images = Vec::new();
-        let mut entries = fs::read_dir(IMAGE_DIRECTORY).await?;
+        let mut entries = match fs::read_dir(IMAGE_DIRECTORY).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self { images }),
+            Err(err) => return Err(err),
+        };
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_file() {
-                images.push(entry.path());
+                let canonical_path = entry.path().canonicalize()?;
+                images.push(canonical_path);
             }
         }
 
@@ -239,7 +244,7 @@ impl ImageCacheData {
 
         // Short-circuit if no space needs to be freed.
         if available_size >= required {
-            return Ok(())
+            return Ok(());
         }
 
         info!("Freeing image space for {required} bytes (available: {available_size})");
@@ -270,11 +275,13 @@ impl ImageCacheData {
     }
 
     /// Add an image's path to the cache.
-    pub fn add<P>(&mut self, path: P)
+    pub fn add<P>(&mut self, path: P) -> Result<(), io::Error>
     where
         P: Into<PathBuf>,
     {
-        self.images.insert(0, path.into());
+        let canonical_path = path.into().canonicalize()?;
+        self.images.insert(0, canonical_path);
+        Ok(())
     }
 }
 
@@ -283,7 +290,7 @@ impl ImageCacheData {
 /// This is based on the available disk space with a slight bit of buffer to
 /// prevent catastrophic failures.
 fn available_image_space() -> Result<u64, Error> {
-    let statvfs = rustix::fs::statvfs(IMAGE_DIRECTORY)?;
+    let statvfs = rustix::fs::statvfs(".")?;
 
     let total = statvfs.f_blocks * statvfs.f_bsize;
     let reserved = (total as f64 * MIN_FREE_SPACE_PERCENTAGE).ceil() as u64;

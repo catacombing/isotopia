@@ -155,6 +155,9 @@ async fn post_image(
         },
     };
 
+    // Guard to remove the file if write isn't successful.
+    let file_drop = RemoveFileOnDrop::new(std::path::Path::new(&path));
+
     // Write chunked data to our image file.
     loop {
         let mut chunk = match field.chunk().await {
@@ -180,7 +183,11 @@ async fn post_image(
     }
 
     // Add image to path cache.
-    set_on_drop.state().image_cache.write().await.add(path);
+    if let Err(err) = set_on_drop.state().image_cache.write().await.add(&path) {
+        error!("Unable to add image path to LRU cache: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    file_drop.reclaim();
 
     // Update status code.
     let ReclaimedSetBuildingOnDrop { state, device, md5sum } = set_on_drop.reclaim();
@@ -299,4 +306,32 @@ struct ReclaimedSetBuildingOnDrop {
     state: Arc<State>,
     device: Device,
     md5sum: String,
+}
+
+struct RemoveFileOnDrop<'a> {
+    path: Option<&'a std::path::Path>,
+}
+
+impl<'a> RemoveFileOnDrop<'a> {
+    fn new(path: &'a std::path::Path) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Reclaim the path, preventing cleanup on drop.
+    fn reclaim(mut self) {
+        self.path = None;
+    }
+}
+
+impl<'a> Drop for RemoveFileOnDrop<'a> {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let path = path.to_path_buf();
+            tokio::spawn(async move {
+                if let Err(err) = fs::remove_file(&path).await {
+                    error!("Unable to remove image file after failed write: {err}");
+                }
+            });
+        }
+    }
 }
