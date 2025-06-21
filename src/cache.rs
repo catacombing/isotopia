@@ -177,12 +177,15 @@ impl AlarmChecksumCacheData {
 }
 
 /// Installation image LRU cache.
-#[derive(Default)]
 pub struct ImageCache {
     data: Mutex<ImageCacheData>,
 }
 
 impl ImageCache {
+    pub async fn new() -> Result<Self, io::Error> {
+        Ok(Self { data: Mutex::new(ImageCacheData::new().await?) })
+    }
+
     /// Obtain a write lock to the underlying data.
     ///
     /// This allows calling [`ImageCacheData::free_space`] and writing to disk
@@ -194,9 +197,23 @@ impl ImageCache {
 }
 
 /// Writeable installation image LRU cache.
-#[derive(Default)]
 pub struct ImageCacheData {
     images: Vec<PathBuf>,
+}
+
+impl ImageCacheData {
+    async fn new() -> Result<Self, io::Error> {
+        // Get all existing image files.
+        let mut images = Vec::new();
+        let mut entries = fs::read_dir(IMAGE_DIRECTORY).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                images.push(entry.path());
+            }
+        }
+
+        Ok(Self { images })
+    }
 }
 
 impl ImageCacheData {
