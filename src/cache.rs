@@ -252,15 +252,20 @@ impl ImageCacheData {
         // Remove least recently used images until we have enough space.
         while available_size < required {
             // Get the least recently used image's path.
-            let path = match self.images.last() {
+            let path = match self.images.pop() {
                 Some(path) => path,
                 None => break,
             };
 
             // Remove the file and add its size to the available space.
-            let size = fs::metadata(&path).await?.len();
-            fs::remove_file(&path).await?;
-            available_size += size;
+            let size = fs::metadata(&path)
+                .await
+                .inspect_err(|err| error!("Unable to read image metadata: {err}"))
+                .map_or(0, |meta| meta.len());
+            match fs::remove_file(&path).await {
+                Ok(_) => available_size += size,
+                Err(err) => error!("Unable to remove image: {err}"),
+            }
 
             info!("Removed {path:?}: {size} bytes (available: {available_size})");
         }
