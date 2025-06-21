@@ -145,8 +145,11 @@ async fn post_image(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Open image file handle.
+    // If the file exists already, but we're unaware of it, nuke it.
     let path = format!("{IMAGE_DIRECTORY}/alarm-{}-{}.img.xz", device, set_on_drop.md5sum);
+    let _ = fs::remove_file(&path).await;
+
+    // Open image file handle.
     let mut file = match OpenOptions::new().create_new(true).append(true).open(&path).await {
         Ok(file) => file,
         Err(err) => {
