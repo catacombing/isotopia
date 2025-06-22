@@ -88,6 +88,14 @@ async fn post_request(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<PostRequestRequest>,
 ) -> Response {
+    // Do some trivial package sanitization.
+    //
+    // This should not be necessary, but seems prudent to ensure possible future
+    // screwups don't put users at risk.
+    if let Err(err) = validate_packages(&body.packages) {
+        return err.into_response();
+    }
+
     let request = match state.db.add_request(body.device, body.packages).await {
         Ok(status) => status,
         Err(err) => return Error::Sql(err).into_response(),
@@ -172,7 +180,6 @@ async fn post_image(
         // Ensure enough storage space is available.
         let mut cache_lock = set_on_drop.state().image_cache.write().await;
         if let Err(err) = cache_lock.free_space(chunk.len() as u64).await {
-            error!("Unable to free disk space: {err}");
             return err.into_response();
         }
 
@@ -342,5 +349,49 @@ impl<'a> Drop for RemoveFileOnDrop<'a> {
                 }
             });
         }
+    }
+}
+
+/// Validate a build request's package list.
+fn validate_packages(packages: &[String]) -> Result<(), Error> {
+    for package in packages {
+        if package.is_empty()
+            || package.starts_with('.')
+            || package.starts_with('-')
+            || !package
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ['@', '.', '_', '+', '-'].contains(&c))
+        {
+            return Err(Error::InvalidPackage(package.clone()));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_validation() {
+        assert!(
+            validate_packages(&[
+                "valid.".into(),
+                "valid-".into(),
+                "@valid".into(),
+                "va_lid".into(),
+                "gnu+linux".into()
+            ])
+            .is_ok()
+        );
+        assert!(validate_packages(&["valid".into(), "valid2".into()]).is_ok());
+
+        assert!(validate_packages(&["valid".into(), "-invalid".into(), "valid".into()]).is_err());
+        assert!(validate_packages(&[".dotstart".into()]).is_err());
+        assert!(validate_packages(&["( ͡° ͜ʖ ͡°)".into()]).is_err());
+        assert!(validate_packages(&["\"".into()]).is_err());
+        assert!(validate_packages(&["!".into()]).is_err());
+        assert!(validate_packages(&["".into()]).is_err());
     }
 }

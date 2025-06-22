@@ -84,6 +84,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("invalid device {0:?}")]
     InvalidDevice(String),
+    #[error("invalid package: {0:?}")]
+    InvalidPackage(String),
     #[error("missing UPLOAD_SECRET environment variable")]
     MissingUploadSecret,
     #[error("invalid request status transition")]
@@ -104,6 +106,7 @@ impl IntoResponse for Error {
                 (StatusCode::BAD_REQUEST, msg).into_response()
             },
             Self::Rustix(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Self::InvalidPackage(_) => StatusCode::BAD_REQUEST.into_response(),
             // This error is never returned inside a request.
             Self::MissingUploadSecret => unreachable!(),
         }
