@@ -392,6 +392,7 @@ mod tests {
         assert!(validate_packages(&["( ͡° ͜ʖ ͡°)".into()]).is_err());
         assert!(validate_packages(&["\"".into()]).is_err());
         assert!(validate_packages(&["!".into()]).is_err());
+        assert!(validate_packages(&[" ".into()]).is_err());
         assert!(validate_packages(&["".into()]).is_err());
     }
 }
