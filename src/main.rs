@@ -97,7 +97,6 @@ impl IntoResponse for Error {
         debug!("Request failed: {}", self);
 
         match self {
-            Self::Sql(_) => StatusCode::OK.into_response(),
             Self::StatusConflict => StatusCode::CONFLICT.into_response(),
             Self::InvalidDevice(device) => {
                 let msg = format!(
@@ -105,7 +104,9 @@ impl IntoResponse for Error {
                 );
                 (StatusCode::BAD_REQUEST, msg).into_response()
             },
-            Self::Rustix(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Self::Rustix(_) | Self::Sql(_) | Self::Io(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            },
             Self::InvalidPackage(_) => StatusCode::BAD_REQUEST.into_response(),
             // This error is never returned inside a request.
             Self::MissingUploadSecret => unreachable!(),

@@ -29,6 +29,7 @@ pub fn router() -> Router<Arc<State>> {
     let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any).allow_origin(Any);
 
     Router::new()
+        .route("/health", get(get_health))
         .route("/requests/pending", get(get_pending))
         .route("/requests/{device}/{md5sum}/status", put(put_status))
         .route("/requests/{device}/{md5sum}/status", get(get_status))
@@ -49,6 +50,23 @@ async fn get_pending(AxumState(state): AxumState<Arc<State>>) -> Response {
     };
 
     Json(pending).into_response()
+}
+
+/// Get service health.
+///
+/// This endpoint should help figuring out when the isotopia client or build
+/// server are having issues.
+async fn get_health(AxumState(state): AxumState<Arc<State>>) -> Response {
+    let slow_requests = match state.db.slow_requests().await {
+        Ok(slow_requests) => slow_requests,
+        Err(err) => return Error::Sql(err).into_response(),
+    };
+
+    if slow_requests.is_empty() {
+        (StatusCode::OK, Json("healthy")).into_response()
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(slow_requests)).into_response()
+    }
 }
 
 /// Set a build job as "in progress".

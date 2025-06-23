@@ -41,6 +41,21 @@ impl Db {
         Ok(requests)
     }
 
+    /// Get possibly failed build requests.
+    pub async fn slow_requests(&self) -> Result<Vec<Request>, sqlx::Error> {
+        let requests = sqlx::query_as!(
+            Request,
+            r#"
+                SELECT md5sum, device as "device: _", packages, status as "status: _", updated_at
+                FROM requests
+                WHERE status = 'building' AND updated_at < datetime('now', '-15 minutes')
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(requests)
+    }
+
     /// Request a new image to be built.
     ///
     /// This will return `true` if a new built was started.
@@ -298,6 +313,7 @@ impl TryFrom<&str> for Device {
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
     use tokio::time::{Duration, sleep};
 
     use super::*;
@@ -518,5 +534,51 @@ mod tests {
         .unwrap()
         .is_some();
         assert!(!has_request);
+    }
+
+    #[tokio::test]
+    async fn slow_requests() {
+        let db = Db::new().await.unwrap();
+
+        let packages = vec!["__test_slow_requests".into()];
+        let combined_packages = &packages[0];
+        let md5sum = format!("{:x}", md5::compute(combined_packages));
+        let device = Device::PinePhone;
+
+        // Cleanup old test data.
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Create new building request.
+        db.add_request(device, packages.clone()).await.unwrap();
+        db.set_status(device, &md5sum, Status::Building).await.unwrap();
+        let slow_requests = db.slow_requests().await.unwrap();
+        assert_eq!(slow_requests, Vec::new());
+
+        // Manually timewarp request to 1 hour ago.
+        sqlx::query!(
+            r#"
+                UPDATE requests
+                SET updated_at = datetime('1970-01-01')
+                WHERE md5sum = $1 AND device = $2
+            "#,
+            md5sum,
+            device
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Ensure request is marked as slow now.
+        let slow_requests = db.slow_requests().await.unwrap();
+        assert_eq!(slow_requests, vec![Request {
+            packages: packages.join(" "),
+            md5sum,
+            device,
+            updated_at: DateTime::UNIX_EPOCH.naive_utc(),
+            status: Status::Building,
+        }],);
     }
 }
