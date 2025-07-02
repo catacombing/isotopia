@@ -269,6 +269,11 @@ async fn get_image(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from_stream(file));
 
+    // Increment download count for the image.
+    if let Err(err) = state.db.increment_downloads(device, &md5sum).await {
+        error!("Failed to increment download count: {err}");
+    }
+
     match response {
         Ok(response) => response,
         Err(err) => {

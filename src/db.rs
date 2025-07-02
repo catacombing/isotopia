@@ -223,6 +223,22 @@ impl Db {
         sqlx::query!("DELETE FROM requests WHERE status = 'done'").execute(&self.pool).await?;
         Ok(())
     }
+
+    /// Add 1 to the request's download count.
+    pub async fn increment_downloads(&self, device: Device, md5sum: &str) -> Result<(), Error> {
+        sqlx::query!(
+            r#"
+                UPDATE requests
+                SET downloads = downloads + 1
+                WHERE md5sum = $1 AND device = $2
+            "#,
+            md5sum,
+            device,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Image build request.
@@ -580,5 +596,38 @@ mod tests {
             updated_at: DateTime::UNIX_EPOCH.naive_utc(),
             status: Status::Building,
         }],);
+    }
+
+    #[tokio::test]
+    async fn increment_download_count() {
+        let db = Db::new().await.unwrap();
+
+        let packages = vec!["__test_increment_download_count".into()];
+        let combined_packages = &packages[0];
+        let md5sum = format!("{:x}", md5::compute(combined_packages));
+        let device = Device::PinePhone;
+
+        // Cleanup old test data.
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Create new request.
+        db.add_request(device, packages.clone()).await.unwrap();
+
+        // Increment download count by one.
+        db.increment_downloads(device, &md5sum).await.unwrap();
+
+        // Ensure count is actually 1.
+        let download_count = sqlx::query_scalar!(
+            "SELECT downloads FROM requests WHERE md5sum = $1 AND device = $2",
+            md5sum,
+            device
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(download_count, 1);
     }
 }
