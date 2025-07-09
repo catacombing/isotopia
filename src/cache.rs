@@ -28,6 +28,9 @@ const MIN_INTERVAL: Duration = Duration::from_secs(60 * 5);
 /// Maximum number of historic checksums stored.
 const MAX_CHECKSUMS: usize = 32;
 
+/// Maximum age before cached images are deleted.
+const MAX_IMAGE_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 14);
+
 /// Checksum cache for the latest ALARM tarball.
 pub struct AlarmChecksumCache {
     data: RwLock<AlarmChecksumCacheData>,
@@ -269,21 +272,8 @@ impl ImageCacheData {
             }
 
             // Ensure file is also removed from 'done' images in DB.
-            if let Some((device, md5sum)) = path
-                .to_string_lossy()
-                .strip_suffix(".img.xz")
-                .and_then(|p| p.rsplit_once('-'))
-                .and_then(|(p, md5sum)| Some((p.rsplit_once('-')?.0, md5sum)))
-            {
-                let device = match Device::try_from(device) {
-                    Ok(device) => device,
-                    Err(_) => {
-                        error!("Unable to parse image file's device ({device})");
-                        continue;
-                    },
-                };
-
-                if let Err(err) = self.db.delete(device, md5sum).await {
+            if let Some((device, md5sum)) = image_id_from_path(&path) {
+                if let Err(err) = self.db.delete(device, &md5sum).await {
                     error!("Unable to delete {device} {md5sum} from DB: {err}");
                 }
             }
@@ -309,6 +299,39 @@ impl ImageCacheData {
         self.images.insert(0, canonical_path);
         Ok(())
     }
+
+    /// Delete outdated images.
+    pub async fn delete_outdated(&mut self) {
+        for i in (0..self.images.len()).rev() {
+            let image = &self.images[i];
+
+            // Skip images which aren't stale.
+            let creation_time = image.metadata().and_then(|meta| meta.created()).ok();
+            let elapsed = creation_time.and_then(|time| time.elapsed().ok());
+            if elapsed.map_or(false, |elapsed| elapsed < MAX_IMAGE_AGE) {
+                continue;
+            }
+
+            // Remove stale image from filesystem.
+            match fs::remove_file(&image).await {
+                Ok(_) => info!("Deleted stale image {image:?}"),
+                Err(err) => {
+                    error!("Failed to delete stale image {image:?}: {err}");
+                    continue;
+                },
+            }
+
+            // Ensure file is also removed from 'done' images in DB.
+            if let Some((device, md5sum)) = image_id_from_path(&image) {
+                if let Err(err) = self.db.delete(device, &md5sum).await {
+                    error!("Unable to delete {device} {md5sum} from DB: {err}");
+                    continue;
+                }
+            }
+
+            self.images.swap_remove(i);
+        }
+    }
 }
 
 /// Get space available for writing images.
@@ -323,4 +346,30 @@ fn available_image_space() -> Result<u64, Error> {
 
     let available = statvfs.f_bavail * statvfs.f_bsize;
     Ok(available.saturating_sub(reserved))
+}
+
+/// Get an image's DB ID from its file path.
+fn image_id_from_path(file: &Path) -> Option<(Device, String)> {
+    let file = file.to_string_lossy();
+    let (device, md5sum) = match file
+        .strip_suffix(".img.xz")
+        .and_then(|p| p.rsplit_once('-'))
+        .and_then(|(p, md5sum)| Some((p.rsplit_once('-')?.0, md5sum)))
+    {
+        Some(image_id) => image_id,
+        None => {
+            error!("Invalid image file: {file:?}");
+            return None;
+        },
+    };
+
+    let device = match Device::try_from(device) {
+        Ok(device) => device,
+        Err(_) => {
+            error!("Unable to parse image file's device ({device})");
+            return None;
+        },
+    };
+
+    Some((device, md5sum.into()))
 }

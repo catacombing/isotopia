@@ -93,6 +93,9 @@ async fn get_status(
     AxumState(state): AxumState<Arc<State>>,
     Path((device, md5sum)): Path<(Device, String)>,
 ) -> Response {
+    // Ensure outdated images are removed.
+    state.image_cache.write().await.delete_outdated().await;
+
     // Update request status.
     match state.db.status(device, &md5sum).await {
         Ok(Some(status)) => Json(status).into_response(),
@@ -113,6 +116,9 @@ async fn post_request(
     if let Err(err) = validate_packages(&body.packages) {
         return err.into_response();
     }
+
+    // Ensure outdated images are removed.
+    state.image_cache.write().await.delete_outdated().await;
 
     let request = match state.db.add_request(body.device, body.packages).await {
         Ok(status) => status,
@@ -235,6 +241,9 @@ async fn get_image(
     if state.alarm_checksum_cache.update_checksum().await.is_some() {
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Ensure outdated images are removed.
+    state.image_cache.write().await.delete_outdated().await;
 
     // Return 404 if we don't have the image.
     match state.db.status(device, &md5sum).await {
