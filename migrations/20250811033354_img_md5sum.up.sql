@@ -1,0 +1,1 @@
+ALTER TABLE requests ADD COLUMN img_md5sum TEXT DEFAULT NULL;

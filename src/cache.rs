@@ -308,7 +308,7 @@ impl ImageCacheData {
             // Skip images which aren't stale.
             let creation_time = image.metadata().and_then(|meta| meta.created()).ok();
             let elapsed = creation_time.and_then(|time| time.elapsed().ok());
-            if elapsed.map_or(false, |elapsed| elapsed < MAX_IMAGE_AGE) {
+            if elapsed.is_some_and(|elapsed| elapsed < MAX_IMAGE_AGE) {
                 continue;
             }
 
@@ -322,7 +322,7 @@ impl ImageCacheData {
             }
 
             // Ensure file is also removed from 'done' images in DB.
-            if let Some((device, md5sum)) = image_id_from_path(&image) {
+            if let Some((device, md5sum)) = image_id_from_path(image) {
                 if let Err(err) = self.db.delete(device, &md5sum).await {
                     error!("Unable to delete {device} {md5sum} from DB: {err}");
                     continue;

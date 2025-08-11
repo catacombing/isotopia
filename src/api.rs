@@ -10,6 +10,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use md5::Context as Md5Context;
 use serde::Deserialize;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -17,7 +18,7 @@ use tokio_util::io::ReaderStream;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::error;
 
-use crate::db::{Device, Status};
+use crate::db::{Device, RequestStatus, Status};
 use crate::{Error, State};
 
 /// Default image output directory.
@@ -193,6 +194,9 @@ async fn post_image(
     // Guard to remove the file if write isn't successful.
     let file_drop = RemoveFileOnDrop::new(std::path::Path::new(&path));
 
+    // File content MD5 checksum.
+    let mut img_md5 = Md5Context::new();
+
     // Write chunked data to our image file.
     loop {
         let mut chunk = match field.chunk().await {
@@ -206,6 +210,9 @@ async fn post_image(
         if let Err(err) = cache_lock.free_space(chunk.len() as u64).await {
             return err.into_response();
         }
+
+        // Add data to content checksum.
+        img_md5.consume(&chunk);
 
         // Write the data chunk to disk.
         if let Err(err) = file.write_all_buf(&mut chunk).await {
@@ -225,7 +232,8 @@ async fn post_image(
 
     // Update status code.
     let ReclaimedSetBuildingOnDrop { state, device, md5sum } = set_on_drop.reclaim();
-    if let Err(err) = state.db.set_status(device, &md5sum, Status::Done).await {
+    let img_md5 = format!("{:x}", img_md5.finalize());
+    if let Err(err) = state.db.set_done(device, &md5sum, &img_md5).await {
         return err.into_response();
     }
 
@@ -247,7 +255,7 @@ async fn get_image(
 
     // Return 404 if we don't have the image.
     match state.db.status(device, &md5sum).await {
-        Ok(Some(Status::Done)) => (),
+        Ok(Some(RequestStatus { status: Status::Done, .. })) => (),
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => return err.into_response(),
     }

@@ -93,10 +93,15 @@ impl Db {
     }
 
     /// Get the status of a build.
-    pub async fn status(&self, device: Device, md5sum: &str) -> Result<Option<Status>, Error> {
-        let status = sqlx::query_scalar!(
+    pub async fn status(
+        &self,
+        device: Device,
+        md5sum: &str,
+    ) -> Result<Option<RequestStatus>, Error> {
+        let status = sqlx::query_as!(
+            RequestStatus,
             r#"
-                SELECT status as "status: _"
+                SELECT status as "status: _", img_md5sum
                 FROM requests
                 WHERE md5sum = $1 AND device = $2
             "#,
@@ -117,10 +122,9 @@ impl Db {
     ) -> Result<(), Error> {
         match status {
             // Ignore transitions to pending, since it is automatic during insert.
-            Status::Pending => return Ok(()),
+            Status::Pending => (),
             // Only allow this transition if 'pending' or timed out 'building'.
             Status::Building => {
-                let status = status.as_str();
                 let status = sqlx::query!(
                     "
                         UPDATE requests
@@ -145,7 +149,6 @@ impl Db {
                 }
             },
             Status::Writing => {
-                let status = status.as_str();
                 let status = sqlx::query!(
                     "
                         UPDATE requests
@@ -167,17 +170,9 @@ impl Db {
                     return Err(Error::StatusConflict);
                 }
             },
-            Status::Done => {
-                let status = status.as_str();
-                sqlx::query!(
-                    "UPDATE requests SET status = $1 WHERE md5sum = $2 AND device = $3",
-                    status,
-                    md5sum,
-                    device,
-                )
-                .execute(&self.pool)
-                .await?;
-            },
+            // Ignore transitions to done, since it requires setting checksum.
+            // See `Self::set_done`.
+            Status::Done => (),
         }
 
         Ok(())
@@ -200,6 +195,28 @@ impl Db {
             "UPDATE requests SET status = $1 WHERE md5sum = $2 AND device = $3",
             status,
             md5sum,
+            device,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark request as done.
+    pub async fn set_done(
+        &self,
+        device: Device,
+        packages_md5sum: &str,
+        img_md5sum: &str,
+    ) -> Result<(), Error> {
+        sqlx::query!(
+            r#"
+                UPDATE requests
+                SET status = 'done', img_md5sum = $1
+                WHERE md5sum = $2 AND device = $3
+            "#,
+            img_md5sum,
+            packages_md5sum,
             device,
         )
         .execute(&self.pool)
@@ -284,17 +301,6 @@ pub enum Status {
     Done,
 }
 
-impl Status {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Building => "building",
-            Self::Writing => "writing",
-            Self::Done => "done",
-        }
-    }
-}
-
 /// Image target device,
 #[derive(Type, Deserialize, Serialize, Copy, Clone, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -325,6 +331,14 @@ impl TryFrom<&str> for Device {
             _ => Err(()),
         }
     }
+}
+
+/// Status of a build request.
+#[derive(Serialize)]
+pub struct RequestStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub img_md5sum: Option<String>,
+    pub status: Status,
 }
 
 #[cfg(test)]
@@ -375,7 +389,7 @@ mod tests {
         assert!(!is_pending);
 
         // Mark request as done.
-        db.set_status(device, &md5sum, Status::Done).await.unwrap();
+        db.set_done(device, &md5sum, "xxx").await.unwrap();
 
         // Done jobs should be hidden from pending list.
         let pending_done = db.pending().await.unwrap();
@@ -417,7 +431,7 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
 
         // Get timestamp after status change.
-        db.set_status(device, &md5sum, Status::Done).await.unwrap();
+        db.set_done(device, &md5sum, "xxx").await.unwrap();
         let after_update = sqlx::query_scalar!(
             "SELECT updated_at FROM requests WHERE md5sum = $1 AND device = $2",
             md5sum,
@@ -447,7 +461,7 @@ mod tests {
 
         // Mark package as done.
         db.add_request(device, packages.clone()).await.unwrap();
-        db.set_status(device, &md5sum, Status::Done).await.unwrap();
+        db.set_done(device, &md5sum, "xxx").await.unwrap();
 
         // Ensure status cannot 'regress'.
         db.set_status(device, &md5sum, Status::Pending).await.unwrap();
@@ -500,12 +514,12 @@ mod tests {
         db.set_status(Device::PinePhonePro, &md5sum, Status::Building).await.unwrap();
 
         // Reinsert PPP to ensure it's still building.
-        let ppp_status = db.status(Device::PinePhonePro, &md5sum).await.unwrap();
-        assert_eq!(ppp_status, Some(Status::Building));
+        let ppp_status = db.status(Device::PinePhonePro, &md5sum).await.unwrap().unwrap();
+        assert_eq!(ppp_status.status, Status::Building);
 
         // Reinsert PP to ensure it's still pending.
-        let pp_status = db.status(Device::PinePhone, &md5sum).await.unwrap();
-        assert_eq!(pp_status, Some(Status::Pending));
+        let pp_status = db.status(Device::PinePhone, &md5sum).await.unwrap().unwrap();
+        assert_eq!(pp_status.status, Status::Pending);
     }
 
     #[tokio::test]
@@ -538,7 +552,7 @@ mod tests {
         assert!(has_request);
 
         // Done requests are deleted.
-        db.set_status(device, &md5sum, Status::Done).await.unwrap();
+        db.set_done(device, &md5sum, "xxx").await.unwrap();
         db.delete_done().await.unwrap();
         let has_request = sqlx::query!(
             "SELECT * FROM requests WHERE md5sum = $1 AND device = $2",
@@ -629,5 +643,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(download_count, 1);
+    }
+
+    #[tokio::test]
+    async fn set_status_done() {
+        let db = Db::new().await.unwrap();
+
+        let packages = vec!["__test_set_status_done".into()];
+        let combined_packages = &packages[0];
+        let packages_md5sum = format!("{:x}", md5::compute(combined_packages));
+        let img_md5sum = format!("{:x}", md5::compute("img content"));
+        let device = Device::PinePhone;
+
+        // Cleanup old test data.
+        sqlx::query!(
+            "DELETE FROM requests WHERE md5sum = $1 AND device = $2",
+            packages_md5sum,
+            device
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Create new building request.
+        db.add_request(device, packages.clone()).await.unwrap();
+        db.set_status(device, &packages_md5sum, Status::Building).await.unwrap();
+        let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
+        assert_eq!(status.status, Status::Building);
+
+        // Ensure done without content checksum is ignored.
+        db.set_status(device, &packages_md5sum, Status::Done).await.unwrap();
+        let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
+        assert_eq!(status.status, Status::Building);
+
+        // Mark request as done.
+        db.set_done(device, &packages_md5sum, &img_md5sum).await.unwrap();
+        let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
+        assert_eq!(status.img_md5sum, Some(img_md5sum));
+        assert_eq!(status.status, Status::Done);
     }
 }
