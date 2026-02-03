@@ -100,7 +100,8 @@ impl IntoResponse for Error {
             Self::StatusConflict => StatusCode::CONFLICT.into_response(),
             Self::InvalidDevice(device) => {
                 let msg = format!(
-                    "unexpected device {device:?}; expected one of `pinephone`, or `pinephone-pro`"
+                    "unexpected device {device:?}; expected one of `pinephone`, `pinephone-pro`, \
+                     or `fairphone-fp5`"
                 );
                 (StatusCode::BAD_REQUEST, msg).into_response()
             },

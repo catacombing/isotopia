@@ -310,12 +310,16 @@ pub enum Device {
     #[sqlx(rename = "pinephone-pro")]
     PinePhonePro,
     PinePhone,
+    #[serde(rename = "fairphone-fp5")]
+    #[sqlx(rename = "fairphone-fp5")]
+    Fairphone5,
 }
 
 impl Display for Device {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
             Self::PinePhonePro => write!(f, "pinephone-pro"),
+            Self::Fairphone5 => write!(f, "fairphone-fp5"),
             Self::PinePhone => write!(f, "pinephone"),
         }
     }
@@ -327,6 +331,7 @@ impl TryFrom<&str> for Device {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
             "pinephone-pro" => Ok(Device::PinePhonePro),
+            "fairphone-fp5" => Ok(Device::Fairphone5),
             "pinephone" => Ok(Device::PinePhone),
             _ => Err(()),
         }
@@ -334,7 +339,7 @@ impl TryFrom<&str> for Device {
 }
 
 /// Status of a build request.
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq, Eq, Debug)]
 pub struct RequestStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub img_md5sum: Option<String>,
@@ -681,5 +686,34 @@ mod tests {
         let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
         assert_eq!(status.img_md5sum, Some(img_md5sum));
         assert_eq!(status.status, Status::Done);
+    }
+
+    #[tokio::test]
+    async fn devices() {
+        let db = Db::new().await.unwrap();
+
+        let packages = vec!["__test_devices".into()];
+        let combined_packages = &packages[0];
+        let md5sum = format!("{:x}", md5::compute(combined_packages));
+
+        // Cleanup old test data.
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1", md5sum)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let test_device = async |device| {
+            let status = db.status(device, &md5sum).await.unwrap();
+            assert_eq!(status, None);
+
+            db.add_request(device, packages.clone()).await.unwrap();
+
+            let status = db.status(device, &md5sum).await.unwrap().unwrap();
+            assert_eq!(status.status, Status::Pending);
+        };
+
+        test_device(Device::PinePhone).await;
+        test_device(Device::PinePhonePro).await;
+        test_device(Device::Fairphone5).await;
     }
 }
