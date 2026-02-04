@@ -280,9 +280,17 @@ async fn get_image(
         },
     };
 
+    // Add `-root` suffix to filename for devices with split images.
+    let disposition = match device {
+        Device::Fairphone5 => {
+            format!("attachment; filename=\"alarm-{device}-{md5sum}-root.img.xz\"")
+        },
+        Device::PinePhonePro | Device::PinePhone => format!("attachment; filename=\"{filename}\""),
+    };
+
     // Create our response with headers indicating binary file download.
     let response = Response::builder()
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
+        .header(header::CONTENT_DISPOSITION, disposition)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from_stream(file));
 
