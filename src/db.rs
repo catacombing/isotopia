@@ -101,7 +101,7 @@ impl Db {
         let status = sqlx::query_as!(
             RequestStatus,
             r#"
-                SELECT status as "status: _", img_md5sum
+                SELECT status as "status: _", img_md5sum, error
                 FROM requests
                 WHERE md5sum = $1 AND device = $2
             "#,
@@ -343,6 +343,7 @@ impl TryFrom<&str> for Device {
 pub struct RequestStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub img_md5sum: Option<String>,
+    pub error: Option<String>,
     pub status: Status,
 }
 
@@ -675,17 +676,20 @@ mod tests {
         db.set_status(device, &packages_md5sum, Status::Building).await.unwrap();
         let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
         assert_eq!(status.status, Status::Building);
+        assert_eq!(status.error, None);
 
         // Ensure done without content checksum is ignored.
         db.set_status(device, &packages_md5sum, Status::Done).await.unwrap();
         let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
         assert_eq!(status.status, Status::Building);
+        assert_eq!(status.error, None);
 
         // Mark request as done.
         db.set_done(device, &packages_md5sum, &img_md5sum).await.unwrap();
         let status = db.status(device, &packages_md5sum).await.unwrap().unwrap();
         assert_eq!(status.img_md5sum, Some(img_md5sum));
         assert_eq!(status.status, Status::Done);
+        assert_eq!(status.error, None);
     }
 
     #[tokio::test]
@@ -715,5 +719,44 @@ mod tests {
         test_device(Device::PinePhone).await;
         test_device(Device::PinePhonePro).await;
         test_device(Device::Fairphone5).await;
+    }
+
+    #[tokio::test]
+    async fn status_error() {
+        let db = Db::new().await.unwrap();
+
+        let packages = vec!["__test_status_error".into()];
+        let combined_packages = &packages[0];
+        let md5sum = format!("{:x}", md5::compute(combined_packages));
+        let device = Device::Fairphone5;
+
+        // Cleanup old test data.
+        sqlx::query!("DELETE FROM requests WHERE md5sum = $1 AND device = $2", md5sum, device)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Add a new request.
+        db.add_request(device, packages.clone()).await.unwrap();
+
+        // Manually mark request as failed.
+        sqlx::query!(
+            "
+            UPDATE requests
+            SET status = 'done',
+                error = 'build failed'
+            WHERE md5sum = $1
+                AND device = $2",
+            md5sum,
+            device,
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Ensure request is marked as failed.
+        let status = db.status(device, &md5sum).await.unwrap().unwrap();
+        assert_eq!(status.error.as_deref(), Some("build failed"));
+        assert_eq!(status.status, Status::Done);
     }
 }
