@@ -280,10 +280,10 @@ async fn get_image(
         },
     };
 
-    // Add `-root` suffix to filename for devices with split images.
+    // Add `tar` suffix to filename for devices with split images.
     let disposition = match device {
         Device::Fairphone5 => {
-            format!("attachment; filename=\"alarm-{device}-{md5sum}-root.img.xz\"")
+            format!("attachment; filename=\"alarm-{device}-{md5sum}.tar\"")
         },
         Device::PinePhonePro | Device::PinePhone => format!("attachment; filename=\"{filename}\""),
     };
